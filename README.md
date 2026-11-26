@@ -30,4 +30,4 @@ Les dossiers vides ne sont pas synchronisés.
 
 ## Exécutable Windows (.exe)
 
-Construit automatiquement par GitHub Actions : onglet **Actions → Build Windows exe → Run workflow** (artefact `FolderSync-windows`), ou en poussant un tag `v1.0.0` (publié dans **Releases**). Avec le `.exe` : `FolderSync.exe --install-task --interval 15`.
+Construit automatiquement par GitHub Actions : onglet **Actions → Build Windows exe → Run workflow** (artefact `FolderSync-windows`), ou en modifiant le fichier `VERSION` (la release `vX.Y.Z` est alors créée dans **Releases**). Avec le `.exe` : `FolderSync.exe --install-task --interval 15`.

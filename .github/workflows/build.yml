@@ -2,7 +2,7 @@ name: Build Windows exe
 
 on:
   push:
-    tags: ["v*"]
+    paths: ["VERSION"]
   workflow_dispatch:
 
 permissions:
@@ -24,9 +24,14 @@ jobs:
         with:
           name: FolderSync-windows
           path: dist/FolderSync.exe
-      - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish release (si la version n'existe pas déjà)
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" dist/FolderSync.exe --generate-notes
+        run: |
+          v="v$(tr -d '[:space:]' < VERSION)"
+          if gh release view "$v" >/dev/null 2>&1; then
+            echo "$v existe déjà : pas de nouvelle release (changez VERSION pour en publier une)."
+          else
+            gh release create "$v" dist/FolderSync.exe --target "${{ github.sha }}" --generate-notes
+          fi
