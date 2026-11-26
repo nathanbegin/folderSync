@@ -635,6 +635,17 @@ def remove_task():
 # ----------------------------------------------------------------------------
 # Interface graphique
 # ----------------------------------------------------------------------------
+def make_tray_image():
+    """Icône 64x64 : disque bleu avec deux flèches blanches (⇄)."""
+    from PIL import Image, ImageDraw
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((2, 2, 62, 62), fill=(30, 100, 220, 255))
+    d.polygon([(14, 24), (38, 24), (38, 16), (52, 28), (38, 40), (38, 32), (14, 32)], fill="white")
+    d.polygon([(50, 40), (26, 40), (26, 32), (12, 44), (26, 56), (26, 48), (50, 48)], fill="white")
+    return img
+
+
 def gui(minimized: bool = False):
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
@@ -653,12 +664,15 @@ def gui(minimized: bool = False):
             self.q = queue.Queue()
             self.busy = False
             self.next_run = None
+            self.tray = None
+            self._tray_hint = False
             self._build()
             self._poll()
             self._auto_tick()
             root.protocol("WM_DELETE_WINDOW", self._close)
+            self._start_tray()
             if minimized:
-                root.iconify()
+                root.withdraw() if self.tray else root.iconify()
             if self.cfg.auto_enabled:
                 self._schedule()
                 if self.cfg.auto_on_start:
@@ -850,8 +864,50 @@ def gui(minimized: bool = False):
                 self.v_next.set("Synchronisation automatique désactivée")
             self.root.after(1000, self._auto_tick)
 
-        def _auto_run(self):
-            if self.busy or not self.cfg.auto_enabled:
+        # -- icône de la zone de notification ------------------------------------
+        def _start_tray(self):
+            try:
+                import pystray
+                menu = pystray.Menu(
+                    pystray.MenuItem("Ouvrir FolderSync", lambda: self.q.put(("tray", "show")), default=True),
+                    pystray.MenuItem("Synchroniser maintenant", lambda: self.q.put(("tray", "sync"))),
+                    pystray.MenuItem("Synchronisation automatique", lambda: self.q.put(("tray", "toggle")),
+                                     checked=lambda item: self.cfg.auto_enabled),
+                    pystray.Menu.SEPARATOR,
+                    pystray.MenuItem("Quitter", lambda: self.q.put(("tray", "quit"))))
+                self.tray = pystray.Icon(APP, make_tray_image(), "FolderSync", menu)
+                self.tray.run_detached()
+            except Exception:  # noqa  (pystray/Pillow absents : on garde le comportement sans icône)
+                self.tray = None
+
+        def _tray_title(self, text):
+            if self.tray:
+                try:
+                    self.tray.title = f"FolderSync — {text}"[:120]
+                except Exception:  # noqa
+                    pass
+
+        def _tray_cmd(self, cmd):
+            if cmd == "show":
+                self.root.deiconify()
+                self.root.lift()
+                self.root.focus_force()
+            elif cmd == "sync":
+                self._auto_run(force=True)
+            elif cmd == "toggle":
+                self.v_auto.set(not self.v_auto.get())
+                if self.tray:
+                    self.tray.update_menu()
+            elif cmd == "quit":
+                if self.busy:                       # on laisse finir la synchro en cours
+                    self.root.after(1000, lambda: self.q.put(("tray", "quit")))
+                    return
+                if self.tray:
+                    self.tray.stop()
+                self.root.destroy()
+
+        def _auto_run(self, force=False):
+            if self.busy or not (self.cfg.auto_enabled or force):
                 return
             try:
                 self._read_cfg()
@@ -1041,7 +1097,10 @@ def gui(minimized: bool = False):
                         self.plan = None
                         self.tree.delete(*self.tree.get_children())
                         self._set_busy(False, data)
+                        self._tray_title(data)
                         self._schedule()
+                    elif kind == "tray":
+                        self._tray_cmd(data)
                     elif kind == "error":
                         self._set_busy(False, "Erreur.")
                         messagebox.showerror("Erreur", data)
@@ -1058,12 +1117,21 @@ def gui(minimized: bool = False):
             self.root.after(100, self._poll)
 
         def _close(self):
-            if self.busy:
-                return
             try:
                 self._read_cfg()
             except Exception:  # noqa
                 pass
+            if self.tray:                           # la croix cache la fenêtre : l'icône reste active
+                self.root.withdraw()
+                if not self._tray_hint:
+                    self._tray_hint = True
+                    try:
+                        self.tray.notify("FolderSync reste actif ici. Clic droit sur l'icône pour quitter.", "FolderSync")
+                    except Exception:  # noqa
+                        pass
+                return
+            if self.busy:
+                return
             if self.cfg.auto_enabled:
                 r = messagebox.askyesnocancel(
                     "FolderSync", "La synchronisation automatique est active.\n\n"

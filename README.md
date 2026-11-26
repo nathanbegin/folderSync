@@ -31,3 +31,7 @@ Les dossiers vides ne sont pas synchronisés.
 ## Exécutable Windows (.exe)
 
 Construit automatiquement par GitHub Actions : onglet **Actions → Build Windows exe → Run workflow** (artefact `FolderSync-windows`), ou en modifiant le fichier `VERSION` (la release `vX.Y.Z` est alors créée dans **Releases**). Avec le `.exe` : `FolderSync.exe --install-task --interval 15`.
+
+## Icône dans la zone de notification
+
+L'application place une icône près de l'horloge (clic droit : ouvrir, synchroniser maintenant, activer/désactiver la synchro auto, quitter). La croix de la fenêtre la cache au lieu de quitter. Exécution depuis le code source : `pip install -r requirements.txt` (sans ces paquets, l'application fonctionne sans icône).
