@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from typing import Optional
@@ -118,6 +119,10 @@ class Config:
     excludes: list = field(default_factory=lambda: list(DEFAULT_EXCLUDES))
     versions_dir: str = ""
     keep_days: int = 90
+    auto_enabled: bool = False       # synchronisation automatique pendant que l'application est ouverte
+    interval_min: int = 15           # délai entre deux synchronisations automatiques
+    auto_on_start: bool = True       # synchroniser dès l'ouverture de l'application
+    start_with_windows: bool = False # ouvrir l'application (réduite) au démarrage de Windows
 
     @staticmethod
     def path() -> str:
@@ -370,6 +375,7 @@ class Syncer:
         self.vroot = os.path.join(cfg.versions_root(), self.stamp)
         self.root = {"s": cfg.source, "d": cfg.dest}
         self._log = open(cfg.log_path(), "a", encoding="utf-8")
+        self.lock_path = None
 
     def log(self, msg: str):
         self._log.write(f"{datetime.now():%H:%M:%S} {msg}\n")
@@ -447,6 +453,11 @@ class Syncer:
         for i, a in enumerate(todo, 1):
             if progress:
                 progress(i, len(todo), a.rel)
+            if self.lock_path:
+                try:
+                    os.utime(self.lock_path)     # signale que la synchro est toujours vivante
+                except OSError:
+                    pass
             try:
                 self.do(a)
                 self._remember(state, a.key, plan, a)
@@ -498,8 +509,20 @@ def run_analysis(cfg: Config, progress=None):
 
 
 def run_sync(cfg: Config, plan: Plan, actions: list, state: dict, progress=None) -> dict:
-    sy = Syncer(cfg)
-    return sy.apply(plan, actions, state, progress)
+    lock = os.path.join(app_dir(), "sync.lock")
+    if os.path.exists(lock) and time.time() - os.path.getmtime(lock) < 600:
+        raise RuntimeError("Une synchronisation est déjà en cours (autre fenêtre ou tâche d'arrière-plan).")
+    with open(lock, "w") as f:
+        f.write(str(os.getpid()))
+    try:
+        sy = Syncer(cfg)
+        sy.lock_path = lock
+        return sy.apply(plan, actions, state, progress)
+    finally:
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
 
 
 def deletion_warning(plan: Plan, actions: list) -> Optional[str]:
@@ -565,17 +588,36 @@ def background(interval_min: int) -> int:
         time.sleep(max(1, interval_min) * 60)
 
 
+def launch_cmd(args: str) -> str:
+    exe = sys.executable
+    if getattr(sys, "frozen", False):                            # version .exe (PyInstaller)
+        return f'"{exe}" {args}'
+    pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")      # pythonw = aucune fenêtre console
+    return f'"{pyw if os.path.exists(pyw) else exe}" "{os.path.abspath(__file__)}" {args}'
+
+
+def set_startup(enable: bool):
+    """Windows : ouvre l'application (réduite) à l'ouverture de session, via la clé Run de l'utilisateur."""
+    if not IS_WIN:
+        return
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run",
+                        0, winreg.KEY_SET_VALUE) as k:
+        if enable:
+            winreg.SetValueEx(k, APP, 0, winreg.REG_SZ, launch_cmd("--minimized"))
+        else:
+            try:
+                winreg.DeleteValue(k, APP)
+            except FileNotFoundError:
+                pass
+
+
 def install_task(interval_min: int):
     """Crée une tâche Windows qui démarre FolderSync en arrière-plan à l'ouverture de session."""
     if not IS_WIN:
         print("Disponible seulement sous Windows.")
         return 1
-    exe = sys.executable
-    if getattr(sys, "frozen", False):                            # version .exe (PyInstaller)
-        cmd = f'"{exe}" --background --interval {interval_min}'
-    else:
-        pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")  # pythonw = aucune fenêtre
-        cmd = f'"{pyw if os.path.exists(pyw) else exe}" "{os.path.abspath(__file__)}" --background --interval {interval_min}'
+    cmd = launch_cmd(f"--background --interval {interval_min}")
     r = subprocess.run(["schtasks", "/Create", "/F", "/TN", APP, "/SC", "ONLOGON", "/RL", "LIMITED", "/TR", cmd])
     if r.returncode == 0:
         subprocess.run(["schtasks", "/Run", "/TN", APP])
@@ -593,7 +635,7 @@ def remove_task():
 # ----------------------------------------------------------------------------
 # Interface graphique
 # ----------------------------------------------------------------------------
-def gui():
+def gui(minimized: bool = False):
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
 
@@ -610,9 +652,17 @@ def gui():
             self.state = {}
             self.q = queue.Queue()
             self.busy = False
+            self.next_run = None
             self._build()
             self._poll()
+            self._auto_tick()
             root.protocol("WM_DELETE_WINDOW", self._close)
+            if minimized:
+                root.iconify()
+            if self.cfg.auto_enabled:
+                self._schedule()
+                if self.cfg.auto_on_start:
+                    root.after(1500, self._auto_run)
 
         # -- construction ----------------------------------------------------
         def _build(self):
@@ -664,6 +714,34 @@ def gui():
             ttk.Label(opt, text="Exclusions :").grid(row=3, column=0, sticky="w", pady=(4, 0))
             ttk.Entry(opt, textvariable=self.v_excl).grid(row=3, column=1, columnspan=4, sticky="ew", padx=6, pady=(4, 0))
             opt.columnconfigure(4, weight=1)
+
+            self.v_auto = tk.BooleanVar(value=c.auto_enabled)
+            self.v_interval = tk.IntVar(value=c.interval_min)
+            self.v_onstart = tk.BooleanVar(value=c.auto_on_start)
+            self.v_winstart = tk.BooleanVar(value=c.start_with_windows)
+            self.v_next = tk.StringVar()
+            au = ttk.LabelFrame(self.root, text="Synchronisation automatique", padding=8)
+            au.pack(fill="x", padx=8, pady=(6, 0))
+            ttk.Checkbutton(au, text="Synchroniser automatiquement toutes les", variable=self.v_auto
+                            ).grid(row=0, column=0, sticky="w")
+            ttk.Spinbox(au, from_=1, to=1440, width=6, textvariable=self.v_interval).grid(row=0, column=1, padx=6)
+            ttk.Label(au, text="minutes").grid(row=0, column=2, sticky="w")
+            ttk.Label(au, textvariable=self.v_next, foreground="#0a5").grid(row=0, column=3, sticky="e", padx=(20, 0))
+            ttk.Checkbutton(au, text="Synchroniser dès l'ouverture de l'application", variable=self.v_onstart
+                            ).grid(row=1, column=0, columnspan=3, sticky="w")
+            wcb = ttk.Checkbutton(au, text="Ouvrir l'application (réduite) au démarrage de Windows",
+                                  variable=self.v_winstart)
+            wcb.grid(row=2, column=0, columnspan=3, sticky="w")
+            if not IS_WIN:
+                wcb.state(["disabled"])
+            ttk.Label(au, text="Les suppressions massives et les erreurs sont notées dans le journal ; les conflits "
+                               "gardent les deux versions.", foreground="#666").grid(row=3, column=0, columnspan=4, sticky="w")
+            au.columnconfigure(3, weight=1)
+            self._auto_sig = (c.auto_enabled, c.interval_min)
+            for v in (self.v_src, self.v_dst, self.v_mode, self.v_del, self.v_hash, self.v_online, self.v_verify,
+                      self.v_ver, self.v_days, self.v_excl, self.v_auto, self.v_interval, self.v_onstart,
+                      self.v_winstart):
+                v.trace_add("write", lambda *a: self._changed())
 
             bar = ttk.Frame(self.root, padding=8)
             bar.pack(fill="x")
@@ -729,7 +807,79 @@ def gui():
             except (ValueError, tk.TclError):
                 c.keep_days = 90
             c.excludes = [p.strip() for p in self.v_excl.get().split(";") if p.strip()]
+            c.auto_enabled, c.auto_on_start = self.v_auto.get(), self.v_onstart.get()
+            c.start_with_windows = self.v_winstart.get()
+            try:
+                c.interval_min = max(1, int(self.v_interval.get()))
+            except (ValueError, tk.TclError):
+                c.interval_min = 15
             c.save()
+
+        def _changed(self):
+            """Tout réglage est enregistré immédiatement (répertoires, options, délai)."""
+            prev_win = self.cfg.start_with_windows
+            try:
+                self._read_cfg()
+            except Exception:  # noqa
+                return
+            if (self.cfg.auto_enabled, self.cfg.interval_min) != self._auto_sig:
+                self._auto_sig = (self.cfg.auto_enabled, self.cfg.interval_min)
+                self._schedule()
+            if self.cfg.start_with_windows != prev_win:
+                try:
+                    set_startup(self.cfg.start_with_windows)
+                except Exception as e:  # noqa
+                    messagebox.showerror("Démarrage de Windows", str(e))
+
+        # -- synchronisation automatique ---------------------------------------
+        def _schedule(self):
+            self.next_run = (datetime.now() + timedelta(minutes=max(1, self.cfg.interval_min))
+                             if self.cfg.auto_enabled else None)
+
+        def _auto_tick(self):
+            if self.cfg.auto_enabled and self.next_run:
+                left = (self.next_run - datetime.now()).total_seconds()
+                if left <= 0:
+                    if self.busy:
+                        self.next_run = datetime.now() + timedelta(seconds=30)
+                    else:
+                        self._auto_run()
+                else:
+                    self.v_next.set(f"Prochaine synchro dans {int(left // 60)} min {int(left % 60):02d} s")
+            else:
+                self.v_next.set("Synchronisation automatique désactivée")
+            self.root.after(1000, self._auto_tick)
+
+        def _auto_run(self):
+            if self.busy or not self.cfg.auto_enabled:
+                return
+            try:
+                self._read_cfg()
+                self.cfg.validate()
+            except ValueError as e:
+                self.status.config(text=f"Synchro auto impossible : {e}")
+                self._schedule()
+                return
+            self._set_busy(True, "Synchronisation automatique en cours…")
+
+            def work():
+                try:
+                    plan, state = run_analysis(self.cfg)
+                    todo = [a for a in plan.actions if a.op != "skip"]
+                    warn = deletion_warning(plan, todo)
+                    if warn:
+                        msg = f"cycle sauté — {warn}"
+                    elif todo:
+                        res = run_sync(self.cfg, plan, todo, state)
+                        msg = f"{res['done']} actions, {len(res['errors'])} erreur(s)"
+                    else:
+                        msg = "rien à faire"
+                except Exception as e:  # noqa
+                    msg = f"erreur — {e}"
+                with open(self.cfg.log_path(), "a", encoding="utf-8") as f:
+                    f.write(f"{datetime.now():%H:%M:%S} [auto] {msg}\n")
+                self.q.put(("auto", f"Synchro auto {datetime.now():%H:%M} : {msg}"))
+            threading.Thread(target=work, daemon=True).start()
 
         def _set_busy(self, busy, msg=None):
             self.busy = busy
@@ -887,6 +1037,11 @@ def gui():
                         self.plan, self.state = data
                         self._set_busy(False)
                         self._fill()
+                    elif kind == "auto":
+                        self.plan = None
+                        self.tree.delete(*self.tree.get_children())
+                        self._set_busy(False, data)
+                        self._schedule()
                     elif kind == "error":
                         self._set_busy(False, "Erreur.")
                         messagebox.showerror("Erreur", data)
@@ -903,12 +1058,22 @@ def gui():
             self.root.after(100, self._poll)
 
         def _close(self):
-            if not self.busy:
-                try:
-                    self._read_cfg()
-                except Exception:  # noqa
-                    pass
-                self.root.destroy()
+            if self.busy:
+                return
+            try:
+                self._read_cfg()
+            except Exception:  # noqa
+                pass
+            if self.cfg.auto_enabled:
+                r = messagebox.askyesnocancel(
+                    "FolderSync", "La synchronisation automatique est active.\n\n"
+                                  "Oui = réduire la fenêtre (la synchro continue)\nNon = quitter l'application")
+                if r is None:
+                    return
+                if r:
+                    self.root.iconify()
+                    return
+            self.root.destroy()
 
     root = tk.Tk()
     App(root)
@@ -924,6 +1089,7 @@ if __name__ == "__main__":
     ap.add_argument("--interval", type=int, default=15, help="minutes entre deux cycles (défaut 15)")
     ap.add_argument("--install-task", action="store_true", help="Windows : lancer en arrière-plan à chaque ouverture de session")
     ap.add_argument("--remove-task", action="store_true", help="Windows : retirer la tâche d'arrière-plan")
+    ap.add_argument("--minimized", action="store_true", help="ouvrir l'interface réduite")
     args = ap.parse_args()
     if args.install_task:
         sys.exit(install_task(args.interval))
@@ -931,4 +1097,4 @@ if __name__ == "__main__":
         sys.exit(remove_task())
     if args.background:
         sys.exit(background(args.interval))
-    sys.exit(cli(args.apply, args.force) if args.cli else gui())
+    sys.exit(cli(args.apply, args.force) if args.cli else gui(args.minimized))
