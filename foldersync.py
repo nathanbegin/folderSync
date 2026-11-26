@@ -571,8 +571,11 @@ def install_task(interval_min: int):
         print("Disponible seulement sous Windows.")
         return 1
     exe = sys.executable
-    pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")      # pythonw = aucune fenêtre
-    cmd = f'"{pyw if os.path.exists(pyw) else exe}" "{os.path.abspath(__file__)}" --background --interval {interval_min}'
+    if getattr(sys, "frozen", False):                            # version .exe (PyInstaller)
+        cmd = f'"{exe}" --background --interval {interval_min}'
+    else:
+        pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")  # pythonw = aucune fenêtre
+        cmd = f'"{pyw if os.path.exists(pyw) else exe}" "{os.path.abspath(__file__)}" --background --interval {interval_min}'
     r = subprocess.run(["schtasks", "/Create", "/F", "/TN", APP, "/SC", "ONLOGON", "/RL", "LIMITED", "/TR", cmd])
     if r.returncode == 0:
         subprocess.run(["schtasks", "/Run", "/TN", APP])

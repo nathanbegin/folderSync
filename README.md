@@ -27,3 +27,7 @@ python foldersync.py --remove-task
 - Journal dans `%APPDATA%\FolderSync\logs`, purge des versions après N jours.
 
 Les dossiers vides ne sont pas synchronisés.
+
+## Exécutable Windows (.exe)
+
+Construit automatiquement par GitHub Actions : onglet **Actions → Build Windows exe → Run workflow** (artefact `FolderSync-windows`), ou en poussant un tag `v1.0.0` (publié dans **Releases**). Avec le `.exe` : `FolderSync.exe --install-task --interval 15`.
